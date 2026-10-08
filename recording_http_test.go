@@ -5,6 +5,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
+
+	"github.com/deepch/vdk/av"
 )
 
 func recordingTestRouter(t *testing.T, options RecordingOptions) http.Handler {
@@ -76,5 +79,48 @@ func TestRecordingHTTPCancelsPendingSourceAndStopsIdempotently(t *testing.T) {
 	}
 	if Recordings.Status("example").Active {
 		t.Fatal("recorder did not stop while waiting for source")
+	}
+}
+
+func TestRecordingHTTPKeepsRecoveringSessionActiveAndCancellable(t *testing.T) {
+	router := recordingTestRouter(t, RecordingOptions{})
+	codec, packets := recordingFixture(t)
+	Config.coAd("example", []av.CodecData{codec})
+	request := func(method, action string) recordingAPIStatus {
+		t.Helper()
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(method, "/stream/recording/example"+action, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s %s: status %d, %s", method, action, response.Code, response.Body.String())
+		}
+		var status recordingAPIStatus
+		if err := json.Unmarshal(response.Body.Bytes(), &status); err != nil {
+			t.Fatal(err)
+		}
+		return status
+	}
+	started := request("POST", "/start")
+	awaitRecording(t, func() bool { return Config.HasViewer("example") })
+	for _, packet := range packets {
+		Config.cast("example", packet)
+	}
+	awaitRecording(t, func() bool { return Recordings.Status("example").State == "recording" })
+	Config.sourceDisconnected("example", ErrSourceDisconnected)
+	awaitRecording(t, func() bool { return Recordings.Status("example").State == "reconnecting" })
+	status := request("GET", "")
+	if !status.Active || status.State != "reconnecting" || status.Error != "" {
+		t.Fatalf("transient outage ended the recording session: %+v", status)
+	}
+	duplicate := request("POST", "/start")
+	if duplicate.StartedAt == nil || started.StartedAt == nil || !duplicate.StartedAt.Equal(*started.StartedAt) {
+		t.Fatal("start created another session during recovery")
+	}
+	now := time.Now()
+	stopped := request("POST", "/stop")
+	if time.Since(now) > 2*time.Second || stopped.Active || stopped.State != "stopped" || stopped.Error != "" {
+		t.Fatalf("stop did not cancel camera recovery promptly: %+v", stopped)
+	}
+	if len(stopped.Files) != 1 || stopped.Callback.Completed != 0 {
+		t.Fatalf("single-file recording was not finalized correctly after cancellation: %+v", stopped)
 	}
 }

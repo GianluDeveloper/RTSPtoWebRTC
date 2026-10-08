@@ -181,3 +181,35 @@ test("callback errors remain visible without blocking recording controls", async
   assert.match(recording.elements.callback.textContent, /3 completed, 1 pending, 1 failed/);
   assert.match(recording.elements.callback.textContent, /Script timeout/);
 });
+
+test("camera recovery stays active, clears its message on resume, and can be stopped", async (t) => {
+  const requests = [];
+  let recovering = true;
+  t.mock.method(globalThis, "fetch", async (path, options) => {
+    requests.push({ path, options });
+    if (path.endsWith("/stop")) return response(state({ state: "stopped" }));
+    return response(state({
+      active: true, state: recovering ? "reconnecting" : "recording",
+      retry_count: 3, last_retry_error: recovering ? "No video packets received" : "",
+      current_file: "example/recording.mp4.part",
+    }));
+  });
+  const recording = makeRecording(t);
+  await recording.resume();
+  assert.equal(recording.known, true);
+  assert.equal(recording.elements.button.disabled, false);
+  assert.equal(recording.elements.button.textContent, "Stop recording");
+  assert.match(recording.elements.status.textContent, /will resume automatically/);
+  assert.match(recording.elements.status.textContent, /Recovery attempt: 3/);
+  assert.match(recording.elements.status.textContent, /No video packets received/);
+  recovering = false;
+  await recording.update();
+  assert.equal(recording.elements.status.textContent, "Recording in progress.");
+  recovering = true;
+  await recording.update();
+  await recording.toggle();
+  assert.equal(requests.at(-1).path, "/stream/recording/example%20stream/stop");
+  assert.equal(requests.at(-1).options.method, "POST");
+  assert.equal(recording.elements.button.textContent, "Start recording");
+  assert.equal(recording.data.active, false);
+});

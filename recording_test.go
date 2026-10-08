@@ -256,12 +256,15 @@ func TestRecordingChunksShareFanoutAndFinalizeOnDisconnect(t *testing.T) {
 		}
 	}
 	c.sourceDisconnected("camera", errors.New("test disconnection"))
-	awaitRecording(t, func() bool { return !m.Status("camera").Active })
+	awaitRecording(t, func() bool { return m.Status("camera").State == "reconnecting" })
 	status := m.Status("camera")
-	if status.State != "error" || !strings.Contains(status.Error, "source disconnected") || len(status.Files) != 2 || status.CurrentFile != "" {
+	if !status.Active || status.Error != "" || !strings.Contains(status.LastRetryError, "source disconnected") || len(status.Files) != 2 || status.CurrentFile != "" {
 		t.Fatalf("disconnect failed to finalize chunks: %+v", status)
 	}
-	if len(chunks) != 2 || chunks[0].Final || !chunks[1].Final || chunks[0].Duration != time.Second || chunks[1].Duration != 400*time.Millisecond || chunks[0].Codec != "h264" {
+	if _, err := m.Stop("camera"); err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 2 || chunks[0].Final || chunks[1].Final || chunks[0].Duration != time.Second || chunks[1].Duration != 400*time.Millisecond || chunks[0].Codec != "h264" {
 		t.Fatalf("incorrect finalized chunk notifications: %+v", chunks)
 	}
 	for i, name := range status.Files {
@@ -502,9 +505,12 @@ func TestRecordingOverflowStopsWithoutBlockingViewer(t *testing.T) {
 		}
 	}
 	close(release)
-	awaitRecording(t, func() bool { return !m.Status("camera").Active })
-	if status := m.Status("camera"); status.State != "error" || !strings.Contains(status.Error, "could not keep up") || len(status.Files) < 1 {
+	awaitRecording(t, func() bool { return m.Status("camera").State == "reconnecting" })
+	if status := m.Status("camera"); !status.Active || status.Error != "" || !strings.Contains(status.LastRetryError, "could not keep up") || len(status.Files) < 1 {
 		t.Fatalf("overflow was silent or lost completed files: %+v", status)
+	}
+	if _, err := m.Stop("camera"); err != nil {
+		t.Fatal(err)
 	}
 	c.mutex.RLock()
 	_, survives := c.Streams["camera"].Cl[viewerID]
@@ -544,7 +550,10 @@ func TestRecordingFrameRateOverrideCorrectsSourceClockAfterAssembly(t *testing.T
 				}
 			}
 			c.sourceDisconnected("camera", errors.New("end of timing fixture"))
-			awaitRecording(t, func() bool { return !m.Status("camera").Active })
+			awaitRecording(t, func() bool { return m.Status("camera").State == "reconnecting" })
+			if _, err := m.Stop("camera"); err != nil {
+				t.Fatal(err)
+			}
 			status := m.Status("camera")
 			wantCounts, ticksPerFrame := []int{31}, uint64(1800)
 			if rate > 0 {
@@ -619,5 +628,285 @@ func TestRecordingFrameRateValidationAndFractionalTiming(t *testing.T) {
 	want := time.Duration(math.Round(float64(count) * float64(time.Second) / rate))
 	if accumulated != want {
 		t.Fatalf("fractional frame rate accumulated clock drift: %s vs %s", accumulated, want)
+	}
+}
+
+func TestRecordingReconnectsKeepOneFileAndContinuousTimestamps(t *testing.T) {
+	for _, rate := range []float64{0, 15} {
+		t.Run(strconv.FormatFloat(rate, 'g', -1, 64), func(t *testing.T) {
+			c := recordingTestConfig(t, 0)
+			stream := c.Streams["camera"]
+			stream.Recording.FrameRate = rate
+			c.Streams["camera"] = stream
+			dir := t.TempDir()
+			m := NewRecordingManager(c, dir)
+			defer m.StopAll()
+			started, err := m.Start("camera")
+			if err != nil {
+				t.Fatal(err)
+			}
+			codec, packets := recordingFixture(t)
+			var current string
+			for cycle, origin := range []time.Duration{time.Hour, time.Second, 30 * time.Second} {
+				if cycle > 0 {
+					c.coAd("camera", []av.CodecData{codec})
+				}
+				awaitRecording(t, func() bool { return c.HasViewer("camera") })
+				leading := packets[1]
+				leading.Time = origin - time.Second
+				c.cast("camera", leading) // Discarded pre-IDR packets must not advance the output clock.
+				for i, packet := range packets {
+					packet.Time = origin + time.Duration(i)*200*time.Millisecond
+					c.cast("camera", packet)
+				}
+				c.sourceDisconnected("camera", errors.New("synthetic camera outage"))
+				awaitRecording(t, func() bool {
+					status := m.Status("camera")
+					return status.State == "reconnecting" && status.RetryCount == cycle+1
+				})
+				status := m.Status("camera")
+				if !status.Active || status.Error != "" || status.LastRetryError == "" || status.CurrentFile == "" || len(status.Files) != 0 {
+					t.Fatalf("single-file recording intent was lost: %+v", status)
+				}
+				if cycle == 0 {
+					current = status.CurrentFile
+				} else if status.CurrentFile != current {
+					t.Fatal("unchanged H264 source unexpectedly rotated the single MP4")
+				}
+				if !status.StartedAt.Equal(*started.StartedAt) {
+					t.Fatal("reconnection replaced the recording session")
+				}
+				if status.NextRetryAt == nil || time.Until(*status.NextRetryAt) > time.Second || time.Until(*status.NextRetryAt) < 500*time.Millisecond {
+					t.Fatalf("backoff did not reset after accepted media: %+v", status.NextRetryAt)
+				}
+				duplicate, err := m.Start("camera")
+				if err != nil || !duplicate.StartedAt.Equal(*started.StartedAt) || duplicate.RetryCount != status.RetryCount {
+					t.Fatal("duplicate start replaced reconnecting recording")
+				}
+			}
+			stopStarted := time.Now()
+			status, err := m.Stop("camera")
+			if err != nil || time.Since(stopStarted) > time.Second || status.Active || status.State != "stopped" || status.LastRetryError != "" || status.NextRetryAt != nil || len(status.Files) != 1 {
+				t.Fatalf("stop during retry failed: %+v %v", status, err)
+			}
+			samples := recordingSamples(t, filepath.Join(dir, status.Files[0]))
+			if len(samples) != 21 {
+				t.Fatalf("got %d frames, want 7 complete frames from each generation", len(samples))
+			}
+			step := uint64(18000)
+			if rate > 0 {
+				step = 6000
+			}
+			for i, sample := range samples {
+				if sample.dts != uint64(i)*step || sample.duration != step {
+					t.Fatalf("source reset leaked into MP4 timing at frame %d: %+v", i, sample)
+				}
+				if i%7 == 0 && sample.flags&fmp4io.SampleNoDependencies == 0 {
+					t.Fatal("reconnection resumed without an IDR")
+				}
+			}
+		})
+	}
+}
+
+func TestRecordingInitialOfflineRecoveryAndCancelableBackoff(t *testing.T) {
+	c := recordingTestConfig(t, 0)
+	codec, packets := recordingFixture(t)
+	c.sourceDisconnected("camera", errors.New("initially offline"))
+	m := NewRecordingManager(c, t.TempDir())
+	defer m.StopAll()
+	if _, err := m.Start("camera"); err != nil {
+		t.Fatal(err)
+	}
+	awaitRecording(t, func() bool { return m.Status("camera").State == "reconnecting" })
+	status := m.Status("camera")
+	if !status.Active || status.RetryCount != 1 || status.Error != "" || status.NextRetryAt == nil || !c.HasDemand("camera") {
+		t.Fatalf("initial outage lost recording demand: %+v", status)
+	}
+	*status.NextRetryAt = time.Time{}
+	if m.Status("camera").NextRetryAt.IsZero() {
+		t.Fatal("retry timestamp exposed internal mutable memory")
+	}
+	c.coAd("camera", []av.CodecData{codec})
+	awaitRecording(t, func() bool { return c.HasViewer("camera") })
+	for _, packet := range packets {
+		c.cast("camera", packet)
+	}
+	awaitRecording(t, func() bool { return m.Status("camera").State == "recording" })
+	status = m.Status("camera")
+	if status.LastRetryError != "" || status.NextRetryAt != nil || status.RetryCount != 1 {
+		t.Fatalf("successful media did not clear transient status: %+v", status)
+	}
+	c.sourceDisconnected("camera", errors.New("offline again"))
+	awaitRecording(t, func() bool { return m.Status("camera").State == "reconnecting" })
+	stopStarted := time.Now()
+	m.StopAll()
+	if time.Since(stopStarted) > time.Second {
+		t.Fatal("shutdown waited for reconnect backoff")
+	}
+	if status = m.Status("camera"); status.Active || status.State != "stopped" || status.LastRetryError != "" {
+		t.Fatalf("shutdown while offline failed: %+v", status)
+	}
+	for failures, want := range []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second, 15 * time.Second, 15 * time.Second} {
+		if got := recordingRetryDelay(failures); got != want {
+			t.Fatalf("retry %d delay = %s, want %s", failures, got, want)
+		}
+	}
+}
+
+func TestRecordingReconnectChunkCallbacksKeepSequenceAndFinalFlags(t *testing.T) {
+	c := recordingTestConfig(t, 30)
+	m := NewRecordingManager(c, t.TempDir())
+	defer m.StopAll()
+	events := make(chan RecordingChunk, 8)
+	m.OnChunk = func(chunk RecordingChunk) { events <- chunk }
+	if _, err := m.Start("camera"); err != nil {
+		t.Fatal(err)
+	}
+	codec, packets := recordingFixture(t)
+	for cycle := range 3 {
+		if cycle > 0 {
+			c.coAd("camera", []av.CodecData{codec})
+		}
+		awaitRecording(t, func() bool { return c.HasViewer("camera") })
+		for _, packet := range packets {
+			c.cast("camera", packet)
+		}
+		if cycle < 2 {
+			c.sourceDisconnected("camera", errors.New("chunk boundary outage"))
+			awaitRecording(t, func() bool {
+				status := m.Status("camera")
+				return status.State == "reconnecting" && status.RetryCount == cycle+1
+			})
+			if status := m.Status("camera"); len(status.Files) != cycle+1 || status.CurrentFile != "" {
+				t.Fatalf("outage chunk was not finalized exactly once: %+v", status)
+			}
+		} else {
+			awaitRecording(t, func() bool { return m.Status("camera").State == "recording" })
+		}
+	}
+	status, err := m.Stop("camera")
+	if err != nil || len(status.Files) != 3 || len(events) != 3 {
+		t.Fatalf("wrong completed chunks: %+v %v", status, err)
+	}
+	for i := range 3 {
+		event := <-events
+		if event.Sequence != i+1 || event.Final != (i == 2) || event.Duration <= 0 || event.RelativePath != status.Files[i] {
+			t.Fatalf("callback sequence/final flag incorrect: %+v", event)
+		}
+	}
+}
+
+func TestRecordingCodecChangeRotatesSingleFile(t *testing.T) {
+	c := recordingTestConfig(t, 0)
+	dir := t.TempDir()
+	m := NewRecordingManager(c, dir)
+	defer m.StopAll()
+	codec, packets := recordingFixture(t)
+	pps := append([]byte{}, codec.PPS()...)
+	pps[len(pps)-1] ^= 1
+	changedCodec, err := h264parser.NewCodecDataFromSPSAndPPS(codec.SPS(), pps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Start("camera"); err != nil {
+		t.Fatal(err)
+	}
+	awaitRecording(t, func() bool { return c.HasViewer("camera") })
+	for _, packet := range packets {
+		c.cast("camera", packet)
+	}
+	c.coAd("camera", []av.CodecData{changedCodec}) // Same resolution, different PPS.
+	awaitRecording(t, func() bool { return m.Status("camera").State == "reconnecting" })
+	awaitRecording(t, func() bool { return c.HasViewer("camera") })
+	for _, packet := range packets {
+		packet.Time += time.Hour
+		c.cast("camera", packet)
+	}
+	c.sourceDisconnected("camera", errors.New("end of changed source"))
+	awaitRecording(t, func() bool {
+		status := m.Status("camera")
+		return status.State == "reconnecting" && status.RetryCount == 2
+	})
+	if status := m.Status("camera"); len(status.Files) != 1 || status.CurrentFile == "" {
+		t.Fatalf("changed parameter sets did not rotate the old file: %+v", status)
+	}
+	status, err := m.Stop("camera")
+	if err != nil || len(status.Files) != 2 {
+		t.Fatalf("codec change lost output: %+v %v", status, err)
+	}
+	for _, name := range status.Files {
+		samples := recordingSamples(t, filepath.Join(dir, name))
+		if len(samples) != 7 || samples[0].dts != 0 || samples[0].flags&fmp4io.SampleNoDependencies == 0 {
+			t.Fatal("codec rollover file is not independently decodable")
+		}
+	}
+}
+
+func TestRecordingStorageFailureStaysTerminalOnOutageAndStop(t *testing.T) {
+	for _, chunkSeconds := range []int{0, 30} {
+		t.Run(strconv.Itoa(chunkSeconds), func(t *testing.T) {
+			c := recordingTestConfig(t, chunkSeconds)
+			dir := t.TempDir()
+			m := NewRecordingManager(c, dir)
+			defer m.StopAll()
+			if _, err := m.Start("camera"); err != nil {
+				t.Fatal(err)
+			}
+			awaitRecording(t, func() bool { return c.HasViewer("camera") })
+			_, packets := recordingFixture(t)
+			for _, packet := range packets {
+				c.cast("camera", packet)
+			}
+			awaitRecording(t, func() bool { return m.Status("camera").State == "recording" })
+			target := filepath.Join(dir, strings.TrimSuffix(m.Status("camera").CurrentFile, ".part"))
+			if err := os.WriteFile(target, []byte("existing file"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if chunkSeconds > 0 {
+				c.sourceDisconnected("camera", errors.New("outage while publishing fails"))
+			} else if _, err := m.Stop("camera"); err == nil {
+				t.Fatal("cancellation masked the finalization failure")
+			}
+			awaitRecording(t, func() bool { return !m.Status("camera").Active })
+			if status := m.Status("camera"); status.State != "error" || status.Error == "" || status.RetryCount != 0 || status.NextRetryAt != nil {
+				t.Fatalf("disk failure was incorrectly retried: %+v", status)
+			}
+			if data, err := os.ReadFile(target); err != nil || string(data) != "existing file" {
+				t.Fatal("failed publication overwrote another file")
+			}
+		})
+	}
+}
+
+func TestRecordingReconnectWaitsForFirstSliceOfIDR(t *testing.T) {
+	c := recordingTestConfig(t, 30)
+	stream := c.Streams["camera"]
+	stream.Recording.FrameRate = 15
+	c.Streams["camera"] = stream
+	dir := t.TempDir()
+	m := NewRecordingManager(c, dir)
+	defer m.StopAll()
+	if _, err := m.Start("camera"); err != nil {
+		t.Fatal(err)
+	}
+	awaitRecording(t, func() bool { return c.HasViewer("camera") })
+	_, packets := recordingFixture(t)
+	nalus, _ := h264parser.SplitNALUs(packets[0].Data)
+	partial := packets[0]
+	partial.Data = append([]byte{0, 0, 0, 1}, nalus[1]...)
+	c.cast("camera", partial)
+	for _, packet := range packets[1:] {
+		c.cast("camera", packet)
+	}
+	c.sourceDisconnected("camera", errors.New("end of partial-IDR fixture"))
+	awaitRecording(t, func() bool { return m.Status("camera").State == "reconnecting" })
+	status, err := m.Stop("camera")
+	if err != nil || len(status.Files) != 1 {
+		t.Fatalf("failed to resume after complete IDR: %+v %v", status, err)
+	}
+	samples := recordingSamples(t, filepath.Join(dir, status.Files[0]))
+	if len(samples) != 2 || samples[0].dts != 0 || samples[1].dts != 6000 {
+		t.Fatalf("partial IDR was accepted or skipped frames advanced the override clock: %+v", samples)
 	}
 }

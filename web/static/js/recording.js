@@ -78,7 +78,7 @@ class StreamRecording {
         throw new Error(response.ok ? "Invalid server response" : `HTTP error ${response.status}`);
       }
       if (!response.ok) throw new Error(typeof data?.error === "string" ? data.error : `HTTP error ${response.status}`);
-      if (typeof data?.active !== "boolean" || !["idle", "starting", "recording", "stopping", "stopped", "error"].includes(data.state)) {
+      if (typeof data?.active !== "boolean" || !["idle", "starting", "recording", "reconnecting", "stopping", "stopped", "error"].includes(data.state)) {
         throw new Error("Invalid recording status");
       }
       if (!this.running || generation !== this.generation) return;
@@ -124,10 +124,15 @@ class StreamRecording {
         stopped: "Recording finished. Files saved to the shared host folder.",
         starting: "Waiting for the first keyframe to start recording…",
         recording: "Recording in progress.",
+        reconnecting: "Video stream interrupted. Recording remains active and will resume automatically.",
         stopping: "Finalizing MP4 files…",
         error: "Recording interrupted.",
       };
       status.textContent = labels[data.state];
+      if (data.state === "reconnecting") {
+        if (data.retry_count) status.textContent += ` Recovery attempt: ${data.retry_count}.`;
+        if (data.last_retry_error) status.textContent += ` ${data.last_retry_error}`;
+      }
       if (data.error) status.textContent += ` ${data.error}`;
       if (data.note) status.textContent += ` ${data.note}`;
     }

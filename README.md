@@ -116,9 +116,29 @@ default; set `RTSP_UID` and `RTSP_GID` if your host user has different IDs.
 
 Recordings contain the original H264 video without re-encoding. Other tracks are
 omitted, with an explicit note in the player if the source also has audio. If a
-source disconnects, changes codecs, or storage fails, recording stops and reports
-an error rather than silently producing a file with gaps. Playback remains
-independent. Files are retained until you remove them from the host folder.
+source disconnects or temporarily stops sending video, recording stays active
+and reconnects automatically. The player shows the recovery status and keeps
+**Stop recording** available. Files are retained until you remove them from the
+host folder.
+
+Recovery is enabled automatically, including when recording starts while the
+camera is offline. Retry delays grow from 1 to 2, 4, 8 and at most 15 seconds,
+with no attempt limit, and reset after video resumes. RTSP connection attempts
+and waiting for video or a keyframe have their own timeouts. Recording continues
+to share the existing RTSP connection with viewers.
+
+In single-file mode, the same MP4 continues after reconnection if its H264
+configuration is unchanged. A format change closes that file and starts a new
+MP4. In chunked mode, an interruption closes the current segment; the next one
+starts with a complete keyframe after recovery, retaining the session's sequence
+numbers. Source timestamps are rebased across reconnects to keep file timing
+continuous. Video that was not received cannot be recovered; offline intervals
+are omitted from the playback timeline.
+
+Stopping recording or shutting down the service cancels recovery immediately
+and finalizes available video. Storage and muxing failures remain visible errors
+and stop recording rather than retrying indefinitely. A service restart does not
+automatically restart recording sessions.
 
 Recording API (all responses are JSON):
 
@@ -127,6 +147,9 @@ GET  /stream/recording/<stream-id>
 POST /stream/recording/<stream-id>/start
 POST /stream/recording/<stream-id>/stop
 ```
+
+While recovering, status reports `active: true`, `state: "reconnecting"`,
+`retry_count`, `last_retry_error`, and `next_retry_at` when a retry is scheduled.
 
 ### Callback after each completed chunk
 
@@ -156,7 +179,9 @@ started_at, finalized_at, duration_seconds, sequence, chunk_seconds,
 final, codec
 ```
 
-`final` identifies the last chunk of a recording session. Source credentials,
+`final` is true when a chunk is closed as the recording session ends. A chunk
+closed by a source interruption has `final: false` and is processed immediately;
+stopping while offline does not repeat its callback. Source credentials,
 URL paths and query strings are deliberately excluded from this payload. The
 example writes the JSON to `<chunk>.metadata.json` next to the MP4 on the host;
 replace its operation with your own processing. Scripts can use tools installed
