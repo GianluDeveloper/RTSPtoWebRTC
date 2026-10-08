@@ -8,3 +8,5 @@ bin
 doc
 *_test.go
 web/tests
+recordings
+recording-hooks

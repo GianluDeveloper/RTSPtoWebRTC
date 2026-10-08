@@ -50,7 +50,7 @@ class FakePeer extends EventTarget {
 function makePlayer(t) {
   const video = { currentTime: 0, paused: false, srcObject: null, play: async () => {} };
   const status = { textContent: "" };
-  const player = new StreamPlayer(video, status, "camera165");
+  const player = new StreamPlayer(video, status, "example-camera");
   t.after(() => player.stop());
   return player;
 }
@@ -86,8 +86,8 @@ test("non-trickle signaling waits for complete candidates and uses recvonly trac
   player.pc.gather();
   await flush();
   assert.equal(requests.length, 2);
-  assert.equal(requests[1].path, "/stream/receiver/camera165");
-  assert.equal(requests[1].options.body.get("suuid"), "camera165");
+  assert.equal(requests[1].path, "/stream/receiver/example-camera");
+  assert.equal(requests[1].options.body.get("suuid"), "example-camera");
   assert.match(atob(requests[1].options.body.get("data")), /a=candidate:complete/);
   assert.equal(player.pc.remoteDescription.type, "answer");
   assert.equal(player.session, 1);

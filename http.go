@@ -35,6 +35,9 @@ func newRouter() *gin.Engine {
 	router.POST("/stream/receiver/:uuid", HTTPAPIServerStreamWebRTC)
 	router.GET("/stream/codec/:uuid", HTTPAPIServerStreamCodec)
 	router.POST("/stream", HTTPAPIServerStreamWebRTC2)
+	router.GET("/stream/recording/:uuid", HTTPRecordingStatus)
+	router.POST("/stream/recording/:uuid/start", HTTPRecordingStart)
+	router.POST("/stream/recording/:uuid/stop", HTTPRecordingStop)
 	router.StaticFS("/static", http.Dir("web/static"))
 	return router
 }

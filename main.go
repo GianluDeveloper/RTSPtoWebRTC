@@ -1,25 +1,25 @@
 package main
 
 import (
+	"context"
 	"log"
-	"os"
 	"os/signal"
 	"syscall"
 )
 
 func main() {
 	Config = loadConfig()
+	Recordings = NewRecordingManager(Config, Config.Server.RecordingDir)
+	RecordingCallbacks = NewRecordingCallbackRunner(Config)
+	Recordings.OnChunk = RecordingCallbacks.Submit
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 	go serveHTTP()
 	go serveStreams()
-	sigs := make(chan os.Signal, 1)
-	done := make(chan bool, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		sig := <-sigs
-		log.Println(sig)
-		done <- true
-	}()
 	log.Println("Server Start Awaiting Signal")
-	<-done
+	<-ctx.Done()
+	log.Println("Finalizing active recordings")
+	Recordings.StopAll()
+	RecordingCallbacks.Close()
 	log.Println("Exiting")
 }

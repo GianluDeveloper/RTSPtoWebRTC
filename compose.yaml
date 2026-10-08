@@ -2,11 +2,16 @@ services:
   rtsp-to-webrtc:
     build: .
     image: rtsp-to-webrtc:local
+    # Match the host user so recordings remain manageable outside Docker.
+    user: "${RTSP_UID:-1000}:${RTSP_GID:-1000}"
     restart: unless-stopped
+    stop_grace_period: 30s
     # WebRTC advertises the host's LAN address and uses its UDP ports directly.
     network_mode: host
     volumes:
       - ./config.local.json:/app/config.json:ro
+      - ./recordings:/recordings
+      - ./recording-hooks:/hooks:ro
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8083/healthz"]
       interval: 30s

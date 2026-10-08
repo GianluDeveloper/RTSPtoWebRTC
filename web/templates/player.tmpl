@@ -22,10 +22,20 @@
         <input type="hidden" id="suuid" value="{{ .suuid }}">
         <video class="w-100 bg-dark" id="videoElem" autoplay muted controls playsinline></video>
         <p id="playerStatus" class="text-secondary mt-2" role="status" aria-live="polite">Connecting…</p>
+        <section class="border rounded p-3 mt-3" aria-labelledby="recordingHeading" lang="en">
+          <h2 class="h5" id="recordingHeading">MP4 recording</h2>
+          <button class="btn btn-primary" id="recordingButton" type="button" disabled>Start recording</button>
+          <p id="recordingStatus" class="mt-2 mb-1" role="status" aria-live="polite">Checking recording status…</p>
+          <p id="recordingMode" class="text-secondary mb-1"></p>
+          <p id="recordingFiles" class="text-secondary mb-2 text-break"></p>
+          <p id="recordingCallback" class="small mb-2" role="status"></p>
+          <p class="small text-secondary mb-0">Files are saved to the shared host folder. All viewers share this recording, and it continues after closing this page. Use the button to stop recording.</p>
+        </section>
       </section>
     </div>
   </main>
   <script>window.streamPlayerConfig = { iceServers: {{ .iceServers }} };</script>
   <script src="/static/js/app.js?ver={{ .version }}" defer></script>
+  <script src="/static/js/recording.js?ver={{ .version }}" defer></script>
 </body>
 </html>

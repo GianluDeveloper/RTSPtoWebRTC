@@ -26,12 +26,22 @@ type ConfigST struct {
 }
 
 type ServerST struct {
-	HTTPPort      string   `json:"http_port"`
-	ICEServers    []string `json:"ice_servers"`
-	ICEUsername   string   `json:"ice_username"`
-	ICECredential string   `json:"ice_credential"`
-	WebRTCPortMin uint16   `json:"webrtc_port_min"`
-	WebRTCPortMax uint16   `json:"webrtc_port_max"`
+	HTTPPort                        string   `json:"http_port"`
+	ICEServers                      []string `json:"ice_servers"`
+	ICEUsername                     string   `json:"ice_username"`
+	ICECredential                   string   `json:"ice_credential"`
+	WebRTCPortMin                   uint16   `json:"webrtc_port_min"`
+	WebRTCPortMax                   uint16   `json:"webrtc_port_max"`
+	RecordingDir                    string   `json:"recording_dir"`
+	RecordingCallbackScript         string   `json:"recording_callback_script"`
+	RecordingCallbackTimeoutSeconds int      `json:"recording_callback_timeout_seconds"`
+}
+
+// Zero saves one MP4 per start/stop session; positive values rotate at an IDR.
+type RecordingOptions struct {
+	ChunkSeconds    int     `json:"chunk_seconds"`
+	CallbackEnabled bool    `json:"callback_enabled"`
+	FrameRate       float64 `json:"frame_rate"`
 }
 
 type StreamST struct {
@@ -40,6 +50,7 @@ type StreamST struct {
 	OnDemand     bool              `json:"on_demand"`
 	DisableAudio bool              `json:"disable_audio"`
 	Debug        bool              `json:"debug"`
+	Recording    RecordingOptions  `json:"recording"`
 	RunLock      bool              `json:"-"`
 	Codecs       []av.CodecData    `json:"-"`
 	Cl           map[string]viewer `json:"-"`
@@ -56,7 +67,7 @@ type streamSnapshot struct {
 type viewer struct{ c chan av.Packet }
 
 func loadConfig() *ConfigST {
-	c := &ConfigST{Server: ServerST{HTTPPort: ":8083"}, Streams: make(map[string]StreamST)}
+	c := &ConfigST{Server: ServerST{HTTPPort: ":8083", RecordingDir: "./recordings"}, Streams: make(map[string]StreamST)}
 	data, err := os.ReadFile("config.json")
 	if err == nil {
 		if err := json.Unmarshal(data, c); err != nil {
@@ -78,6 +89,9 @@ func loadConfig() *ConfigST {
 	}
 	if c.Streams == nil {
 		c.Streams = make(map[string]StreamST)
+	}
+	if c.Server.RecordingDir == "" {
+		c.Server.RecordingDir = "./recordings"
 	}
 	for id, stream := range c.Streams {
 		stream.Cl = make(map[string]viewer)
