@@ -1,32 +1,30 @@
 package main
 
 import (
-	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
+	"os"
+	"reflect"
+	"sort"
 	"sync"
 	"time"
 
-	"github.com/deepch/vdk/codec/h264parser"
-
 	"github.com/deepch/vdk/av"
+	"github.com/deepch/vdk/codec/h264parser"
 )
 
-//Config global
-var Config = loadConfig()
+var Config *ConfigST
 
-//ConfigST struct
 type ConfigST struct {
-	mutex   sync.RWMutex
-	Server  ServerST            `json:"server"`
-	Streams map[string]StreamST `json:"streams"`
-	LastError error
+	mutex      sync.RWMutex
+	Server     ServerST            `json:"server"`
+	Streams    map[string]StreamST `json:"streams"`
+	nextViewer uint64
 }
 
-//ServerST struct
 type ServerST struct {
 	HTTPPort      string   `json:"http_port"`
 	ICEServers    []string `json:"ice_servers"`
@@ -36,206 +34,240 @@ type ServerST struct {
 	WebRTCPortMax uint16   `json:"webrtc_port_max"`
 }
 
-//StreamST struct
 type StreamST struct {
-	URL          string `json:"url"`
-	Status       bool   `json:"status"`
-	OnDemand     bool   `json:"on_demand"`
-	DisableAudio bool   `json:"disable_audio"`
-	Debug        bool   `json:"debug"`
-	RunLock      bool   `json:"-"`
-	Codecs       []av.CodecData
-	Cl           map[string]viewer
+	URL          string            `json:"url"`
+	Status       bool              `json:"status"`
+	OnDemand     bool              `json:"on_demand"`
+	DisableAudio bool              `json:"disable_audio"`
+	Debug        bool              `json:"debug"`
+	RunLock      bool              `json:"-"`
+	Codecs       []av.CodecData    `json:"-"`
+	Cl           map[string]viewer `json:"-"`
+	generation   uint64
+	lastDemand   time.Time
+	lastError    error
 }
 
-type viewer struct {
-	c chan av.Packet
+type streamSnapshot struct {
+	codecs     []av.CodecData
+	generation uint64
 }
 
-func (element *ConfigST) RunIFNotRun(uuid string) {
-	element.mutex.Lock()
-	defer element.mutex.Unlock()
-	if tmp, ok := element.Streams[uuid]; ok {
-		if tmp.OnDemand && !tmp.RunLock {
-			tmp.RunLock = true
-			element.Streams[uuid] = tmp
-			go RTSPWorkerLoop(uuid, tmp.URL, tmp.OnDemand, tmp.DisableAudio, tmp.Debug)
-		}
-	}
-}
-
-func (element *ConfigST) RunUnlock(uuid string) {
-	element.mutex.Lock()
-	defer element.mutex.Unlock()
-	if tmp, ok := element.Streams[uuid]; ok {
-		if tmp.OnDemand && tmp.RunLock {
-			tmp.RunLock = false
-			element.Streams[uuid] = tmp
-		}
-	}
-}
-
-func (element *ConfigST) HasViewer(uuid string) bool {
-	element.mutex.Lock()
-	defer element.mutex.Unlock()
-	if tmp, ok := element.Streams[uuid]; ok && len(tmp.Cl) > 0 {
-		return true
-	}
-	return false
-}
-
-func (element *ConfigST) GetICEServers() []string {
-	element.mutex.Lock()
-	defer element.mutex.Unlock()
-	return element.Server.ICEServers
-}
-
-func (element *ConfigST) GetICEUsername() string {
-	element.mutex.Lock()
-	defer element.mutex.Unlock()
-	return element.Server.ICEUsername
-}
-
-func (element *ConfigST) GetICECredential() string {
-	element.mutex.Lock()
-	defer element.mutex.Unlock()
-	return element.Server.ICECredential
-}
-
-func (element *ConfigST) GetWebRTCPortMin() uint16 {
-	element.mutex.Lock()
-	defer element.mutex.Unlock()
-	return element.Server.WebRTCPortMin
-}
-
-func (element *ConfigST) GetWebRTCPortMax() uint16 {
-	element.mutex.Lock()
-	defer element.mutex.Unlock()
-	return element.Server.WebRTCPortMax
-}
+type viewer struct{ c chan av.Packet }
 
 func loadConfig() *ConfigST {
-	var tmp ConfigST
-	data, err := ioutil.ReadFile("config.json")
+	c := &ConfigST{Server: ServerST{HTTPPort: ":8083"}, Streams: make(map[string]StreamST)}
+	data, err := os.ReadFile("config.json")
 	if err == nil {
-		err = json.Unmarshal(data, &tmp)
-		if err != nil {
-			log.Fatalln(err)
+		if err := json.Unmarshal(data, c); err != nil {
+			log.Fatal(err)
 		}
-		for i, v := range tmp.Streams {
-			v.Cl = make(map[string]viewer)
-			tmp.Streams[i] = v
-		}
-	} else {
-		addr := flag.String("listen", "8083", "HTTP host:port")
+	} else if os.IsNotExist(err) {
+		addr := flag.String("listen", ":8083", "HTTP host:port")
 		udpMin := flag.Int("udp_min", 0, "WebRTC UDP port min")
 		udpMax := flag.Int("udp_max", 0, "WebRTC UDP port max")
-		iceServer := flag.String("ice_server", "", "ICE Server")
+		iceServer := flag.String("ice_server", "", "ICE server")
 		flag.Parse()
-
-		tmp.Server.HTTPPort = *addr
-		tmp.Server.WebRTCPortMin = uint16(*udpMin)
-		tmp.Server.WebRTCPortMax = uint16(*udpMax)
-		if len(*iceServer) > 0 {
-			tmp.Server.ICEServers = []string{*iceServer}
+		c.Server.HTTPPort = *addr
+		c.Server.WebRTCPortMin, c.Server.WebRTCPortMax = uint16(*udpMin), uint16(*udpMax)
+		if *iceServer != "" {
+			c.Server.ICEServers = []string{*iceServer}
 		}
-
-		tmp.Streams = make(map[string]StreamST)
+	} else {
+		log.Fatal(err)
 	}
-	return &tmp
+	if c.Streams == nil {
+		c.Streams = make(map[string]StreamST)
+	}
+	for id, stream := range c.Streams {
+		stream.Cl = make(map[string]viewer)
+		c.Streams[id] = stream
+	}
+	return c
 }
 
-func (element *ConfigST) cast(uuid string, pck av.Packet) {
-	element.mutex.Lock()
-	defer element.mutex.Unlock()
-	for _, v := range element.Streams[uuid].Cl {
-		if len(v.c) < cap(v.c) {
-			v.c <- pck
-		}
+func (c *ConfigST) RunIFNotRun(id string) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	stream, ok := c.Streams[id]
+	if !ok {
+		return
+	}
+	stream.lastDemand = time.Now()
+	c.Streams[id] = stream
+	if stream.RunLock {
+		return
+	}
+	stream.RunLock = true
+	c.Streams[id] = stream
+	go RTSPWorkerLoop(id, stream.URL, stream.OnDemand, stream.DisableAudio, stream.Debug)
+}
+
+func (c *ConfigST) RunUnlock(id string) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	stream, ok := c.Streams[id]
+	if ok {
+		stream.RunLock = false
+		c.Streams[id] = stream
 	}
 }
 
-func (element *ConfigST) ext(suuid string) bool {
-	element.mutex.Lock()
-	defer element.mutex.Unlock()
-	_, ok := element.Streams[suuid]
+func (c *ConfigST) HasViewer(id string) bool {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	return len(c.Streams[id].Cl) > 0
+}
+
+// Demand covers codec discovery, ICE gathering and DTLS before registration.
+func (c *ConfigST) HasDemand(id string) bool {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	stream := c.Streams[id]
+	return len(stream.Cl) > 0 || time.Since(stream.lastDemand) < 90*time.Second
+}
+
+func (c *ConfigST) ext(id string) bool {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	_, ok := c.Streams[id]
 	return ok
 }
 
-func (element *ConfigST) coAd(suuid string, codecs []av.CodecData) {
-	element.mutex.Lock()
-	defer element.mutex.Unlock()
-	t := element.Streams[suuid]
-	t.Codecs = codecs
-	element.Streams[suuid] = t
+func (c *ConfigST) addURL(url string) string {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	for id, stream := range c.Streams {
+		if stream.URL == url {
+			return id
+		}
+	}
+	id := fmt.Sprintf("dynamic-%x", sha256.Sum256([]byte(url)))
+	c.Streams[id] = StreamST{URL: url, OnDemand: true, Cl: make(map[string]viewer)}
+	return id
 }
 
-func (element *ConfigST) coGe(suuid string) []av.CodecData {
+// Viewers must renegotiate after a source restart: RTP timestamps and decoder
+// references from the previous session cannot safely be reused.
+func (c *ConfigST) sourceDisconnected(id string, err error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	stream, ok := c.Streams[id]
+	if !ok {
+		return
+	}
+	if len(stream.Cl) > 0 {
+		stream.lastDemand = time.Now()
+	}
+	stream.generation++
+	for cid, v := range stream.Cl {
+		close(v.c)
+		delete(stream.Cl, cid)
+	}
+	stream.Codecs, stream.Status, stream.lastError = nil, false, err
+	c.Streams[id] = stream
+}
+
+func (c *ConfigST) cast(id string, packet av.Packet) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	for cid, v := range c.Streams[id].Cl {
+		select {
+		case v.c <- packet:
+		default:
+			// Arbitrary lost H264 frames corrupt decoding until the next IDR.
+			// Release a slow viewer instead of silently delivering a broken GOP.
+			close(v.c)
+			delete(c.Streams[id].Cl, cid)
+		}
+	}
+}
+
+func (c *ConfigST) coAd(id string, codecs []av.CodecData) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	stream := c.Streams[id]
+	if stream.Status && len(stream.Codecs) > 0 && !reflect.DeepEqual(stream.Codecs, codecs) {
+		if len(stream.Cl) > 0 {
+			stream.lastDemand = time.Now()
+		}
+		for cid, v := range stream.Cl {
+			close(v.c)
+			delete(stream.Cl, cid)
+		}
+		stream.generation++
+	}
+	stream.Codecs = append([]av.CodecData(nil), codecs...)
+	stream.Status, stream.lastError = true, nil
+	c.Streams[id] = stream
+}
+
+func codecsReady(codecs []av.CodecData) bool {
+	if len(codecs) == 0 {
+		return false
+	}
+	for _, codec := range codecs {
+		if codec.Type() == av.H264 {
+			video, ok := codec.(h264parser.CodecData)
+			if !ok || len(video.SPS()) < 4 || len(video.PPS()) < 2 || video.SPS()[0]&0x1f != 7 || video.PPS()[0]&0x1f != 8 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (c *ConfigST) coGe(id string) *streamSnapshot {
 	for i := 0; i < 100; i++ {
-		element.mutex.RLock()
-		tmp, ok := element.Streams[suuid]
-		element.mutex.RUnlock()
+		c.mutex.RLock()
+		stream, ok := c.Streams[id]
+		codecs := append([]av.CodecData(nil), stream.Codecs...)
+		c.mutex.RUnlock()
 		if !ok {
 			return nil
 		}
-		if tmp.Codecs != nil {
-			//TODO Delete test
-			for _, codec := range tmp.Codecs {
-				if codec.Type() == av.H264 {
-					codecVideo := codec.(h264parser.CodecData)
-					if codecVideo.SPS() != nil && codecVideo.PPS() != nil && len(codecVideo.SPS()) > 0 && len(codecVideo.PPS()) > 0 {
-						//ok
-						//log.Println("Ok Video Ready to play")
-					} else {
-						//video codec not ok
-						log.Println("Bad Video Codec SPS or PPS Wait")
-						time.Sleep(50 * time.Millisecond)
-						continue
-					}
-				}
-			}
-			return tmp.Codecs
+		if codecsReady(codecs) {
+			return &streamSnapshot{codecs: codecs, generation: stream.generation}
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	return nil
 }
 
-func (element *ConfigST) clAd(suuid string) (string, chan av.Packet) {
-	element.mutex.Lock()
-	defer element.mutex.Unlock()
-	cuuid := pseudoUUID()
-	ch := make(chan av.Packet, 100)
-	element.Streams[suuid].Cl[cuuid] = viewer{c: ch}
-	return cuuid, ch
+func (c *ConfigST) clAd(id string, generation ...uint64) (string, chan av.Packet) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	ch := make(chan av.Packet, 256)
+	stream, ok := c.Streams[id]
+	if !ok || !stream.Status || (len(generation) > 0 && generation[0] != stream.generation) {
+		close(ch)
+		return "", ch
+	}
+	c.nextViewer++
+	cid := fmt.Sprint(c.nextViewer)
+	stream.Cl[cid] = viewer{c: ch}
+	return cid, ch
 }
 
-func (element *ConfigST) list() (string, []string) {
-	element.mutex.Lock()
-	defer element.mutex.Unlock()
-	var res []string
-	var fist string
-	for k := range element.Streams {
-		if fist == "" {
-			fist = k
-		}
-		res = append(res, k)
+func (c *ConfigST) clDe(id, cid string) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	if v, ok := c.Streams[id].Cl[cid]; ok {
+		close(v.c)
+		delete(c.Streams[id].Cl, cid)
 	}
-	return fist, res
-}
-func (element *ConfigST) clDe(suuid, cuuid string) {
-	element.mutex.Lock()
-	defer element.mutex.Unlock()
-	delete(element.Streams[suuid].Cl, cuuid)
 }
 
-func pseudoUUID() (uuid string) {
-	b := make([]byte, 16)
-	_, err := rand.Read(b)
-	if err != nil {
-		fmt.Println("Error: ", err)
-		return
+func (c *ConfigST) list() (string, []string) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	ids := make([]string, 0, len(c.Streams))
+	for id := range c.Streams {
+		ids = append(ids, id)
 	}
-	uuid = fmt.Sprintf("%X-%X-%X-%X-%X", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
-	return
+	sort.Strings(ids)
+	if len(ids) == 0 {
+		return "", ids
+	}
+	return ids[0], ids
 }

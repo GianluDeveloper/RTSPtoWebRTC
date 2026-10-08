@@ -1,0 +1,10 @@
+.git
+.agents
+.codex
+.aws
+.env*
+config*.json
+bin
+doc
+*_test.go
+web/tests

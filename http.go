@@ -1,268 +1,215 @@
 package main
 
 import (
-	"encoding/json"
+	"errors"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
-	"sort"
 	"time"
 
 	"github.com/deepch/vdk/av"
-
-	webrtc "github.com/deepch/vdk/format/webrtcv3"
 	"github.com/gin-gonic/gin"
 )
 
-type JCodec struct {
-	Type string
+type JCodec struct{ Type string }
+type Response struct {
+	Tracks []string `json:"tracks"`
+	Sdp64  string   `json:"sdp64"`
+}
+type ResponseError struct {
+	Error string `json:"error"`
 }
 
-func serveHTTP() {
+func newRouter() *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
-
-	router := gin.Default()
-	router.Use(CORSMiddleware())
-
-	if _, err := os.Stat("./web"); !os.IsNotExist(err) {
+	router := gin.New()
+	router.Use(gin.Logger(), gin.Recovery(), CORSMiddleware())
+	if _, err := os.Stat("./web"); err == nil {
 		router.LoadHTMLGlob("web/templates/*")
 		router.GET("/", HTTPAPIServerIndex)
 		router.GET("/stream/player/:uuid", HTTPAPIServerStreamPlayer)
 	}
+	router.GET("/healthz", func(c *gin.Context) { c.Status(http.StatusOK) })
 	router.POST("/stream/receiver/:uuid", HTTPAPIServerStreamWebRTC)
 	router.GET("/stream/codec/:uuid", HTTPAPIServerStreamCodec)
 	router.POST("/stream", HTTPAPIServerStreamWebRTC2)
-
 	router.StaticFS("/static", http.Dir("web/static"))
-	err := router.Run(Config.Server.HTTPPort)
-	if err != nil {
-		log.Fatalln("Start HTTP Server error", err)
+	return router
+}
+
+func serveHTTP() {
+	if err := newRouter().Run(Config.Server.HTTPPort); err != nil {
+		log.Fatal("HTTP server: ", err)
 	}
 }
 
-//HTTPAPIServerIndex  index
 func HTTPAPIServerIndex(c *gin.Context) {
-	_, all := Config.list()
+	first, all := Config.list()
+	c.Header("Cache-Control", "no-store")
 	if len(all) > 0 {
-		c.Header("Cache-Control", "no-cache, max-age=0, must-revalidate, no-store")
-		c.Header("Access-Control-Allow-Origin", "*")
-		c.Redirect(http.StatusMovedPermanently, "stream/player/"+all[0])
-	} else {
-		c.HTML(http.StatusOK, "index.tmpl", gin.H{
-			"port":    Config.Server.HTTPPort,
-			"version": time.Now().String(),
+		c.Redirect(http.StatusTemporaryRedirect, "/stream/player/"+first)
+		return
+	}
+	c.HTML(http.StatusOK, "index.tmpl", gin.H{})
+}
+
+func HTTPAPIServerStreamPlayer(c *gin.Context) {
+	id := c.Param("uuid")
+	if !Config.ext(id) {
+		c.JSON(http.StatusNotFound, ResponseError{"stream not found"})
+		return
+	}
+	_, all := Config.list()
+	iceServers := make([]map[string]any, 0, 1)
+	if len(Config.Server.ICEServers) > 0 {
+		iceServers = append(iceServers, map[string]any{
+			"urls": Config.Server.ICEServers, "username": Config.Server.ICEUsername,
+			"credential": Config.Server.ICECredential,
 		})
 	}
-}
-
-//HTTPAPIServerStreamPlayer stream player
-func HTTPAPIServerStreamPlayer(c *gin.Context) {
-	_, all := Config.list()
-	sort.Strings(all)
+	c.Header("Cache-Control", "no-store")
 	c.HTML(http.StatusOK, "player.tmpl", gin.H{
-		"port":     Config.Server.HTTPPort,
-		"suuid":    c.Param("uuid"),
-		"suuidMap": all,
-		"version":  time.Now().String(),
+		"port": Config.Server.HTTPPort, "suuid": id, "suuidMap": all,
+		"version": time.Now().UnixNano(), "iceServers": iceServers,
 	})
 }
 
-//HTTPAPIServerStreamCodec stream codec
+func codecTracks(codecs []av.CodecData) []JCodec {
+	tracks := make([]JCodec, 0, len(codecs))
+	for _, codec := range codecs {
+		if !supportedCodec(codec.Type()) {
+			continue
+		}
+		kind := "audio"
+		if codec.Type().IsVideo() {
+			kind = "video"
+		}
+		tracks = append(tracks, JCodec{Type: kind})
+	}
+	return tracks
+}
+
+func streamCodecs(c *gin.Context, id string) *streamSnapshot {
+	if !Config.ext(id) {
+		c.JSON(http.StatusNotFound, ResponseError{"stream not found"})
+		return nil
+	}
+	Config.RunIFNotRun(id)
+	codecs := Config.coGe(id)
+	if codecs == nil {
+		c.JSON(http.StatusServiceUnavailable, ResponseError{"stream is reconnecting or unavailable"})
+		return nil
+	}
+	if len(codecTracks(codecs.codecs)) == 0 {
+		c.JSON(http.StatusUnprocessableEntity, ResponseError{"no supported media tracks"})
+		return nil
+	}
+	return codecs
+}
+
 func HTTPAPIServerStreamCodec(c *gin.Context) {
-	if Config.ext(c.Param("uuid")) {
-		Config.RunIFNotRun(c.Param("uuid"))
-		codecs := Config.coGe(c.Param("uuid"))
-		if codecs == nil {
-			return
-		}
-		var tmpCodec []JCodec
-		for _, codec := range codecs {
-			if codec.Type() != av.H264 && codec.Type() != av.PCM_ALAW && codec.Type() != av.PCM_MULAW && codec.Type() != av.OPUS {
-				log.Println("Codec Not Supported WebRTC ignore this track", codec.Type())
-				continue
-			}
-			if codec.Type().IsVideo() {
-				tmpCodec = append(tmpCodec, JCodec{Type: "video"})
-			} else {
-				tmpCodec = append(tmpCodec, JCodec{Type: "audio"})
-			}
-		}
-		b, err := json.Marshal(tmpCodec)
-		if err == nil {
-			_, err = c.Writer.Write(b)
-			if err != nil {
-				log.Println("Write Codec Info error", err)
-				return
-			}
-		}
+	if codecs := streamCodecs(c, c.Param("uuid")); codecs != nil {
+		c.Header("Cache-Control", "no-store")
+		c.JSON(http.StatusOK, codecTracks(codecs.codecs))
 	}
 }
 
-//HTTPAPIServerStreamWebRTC stream video over WebRTC
-func HTTPAPIServerStreamWebRTC(c *gin.Context) {
-	if !Config.ext(c.PostForm("suuid")) {
-		log.Println("Stream Not Found")
-		return
+func negotiate(c *gin.Context, id, offer string) (*WebRTCMuxer, *streamSnapshot, string) {
+	if offer == "" {
+		c.JSON(http.StatusBadRequest, ResponseError{"SDP offer required"})
+		return nil, nil, ""
 	}
-	Config.RunIFNotRun(c.PostForm("suuid"))
-	codecs := Config.coGe(c.PostForm("suuid"))
+	codecs := streamCodecs(c, id)
 	if codecs == nil {
-		log.Println("Stream Codec Not Found")
-		return
+		return nil, nil, ""
 	}
-	var AudioOnly bool
-	if len(codecs) == 1 && codecs[0].Type().IsAudio() {
-		AudioOnly = true
-	}
-	muxerWebRTC := webrtc.NewMuxer(webrtc.Options{ICEServers: Config.GetICEServers(), ICEUsername: Config.GetICEUsername(), ICECredential: Config.GetICECredential(), PortMin: Config.GetWebRTCPortMin(), PortMax: Config.GetWebRTCPortMax()})
-	answer, err := muxerWebRTC.WriteHeader(codecs, c.PostForm("data"))
+	server := Config.Server
+	muxer := NewWebRTCMuxer(WebRTCOptions{
+		ICEServers: server.ICEServers, ICEUsername: server.ICEUsername,
+		ICECredential: server.ICECredential, PortMin: server.WebRTCPortMin, PortMax: server.WebRTCPortMax,
+	})
+	answer, err := muxer.WriteHeader(codecs.codecs, offer)
 	if err != nil {
-		log.Println("WriteHeader", err)
+		muxer.Close()
+		log.Printf("stream=%s negotiation failed: %v", id, err)
+		c.JSON(http.StatusBadRequest, ResponseError{"WebRTC negotiation failed"})
+		return nil, nil, ""
+	}
+	return muxer, codecs, answer
+}
+
+func HTTPAPIServerStreamWebRTC(c *gin.Context) {
+	id := c.Param("uuid")
+	if formID := c.PostForm("suuid"); formID != "" && formID != id {
+		c.JSON(http.StatusBadRequest, ResponseError{"stream identifier mismatch"})
 		return
 	}
-	_, err = c.Writer.Write([]byte(answer))
-	if err != nil {
-		log.Println("Write", err)
+	muxer, codecs, answer := negotiate(c, id, c.PostForm("data"))
+	if muxer == nil {
 		return
 	}
-	go func() {
-		cid, ch := Config.clAd(c.PostForm("suuid"))
-		defer Config.clDe(c.PostForm("suuid"), cid)
-		defer muxerWebRTC.Close()
-		var videoStart bool
-		noVideo := time.NewTimer(10 * time.Second)
-		for {
-			select {
-			case <-noVideo.C:
-				log.Println("noVideo")
-				return
-			case pck := <-ch:
-				if pck.IsKeyFrame || AudioOnly {
-					noVideo.Reset(10 * time.Second)
-					videoStart = true
-				}
-				if !videoStart && !AudioOnly {
-					continue
-				}
-				err = muxerWebRTC.WritePacket(pck)
-				if err != nil {
-					log.Println("WritePacket", err)
-					return
-				}
-			}
-		}
-	}()
+	c.Header("Content-Type", "text/plain; charset=utf-8")
+	if _, err := c.Writer.WriteString(answer); err != nil {
+		muxer.Close()
+		return
+	}
+	// Copy all request values before starting a goroutine; Gin reuses contexts.
+	go serveViewer(id, codecs, muxer)
+}
+
+func HTTPAPIServerStreamWebRTC2(c *gin.Context) {
+	rawURL := c.PostForm("url")
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "rtsp" && parsed.Scheme != "rtsps") {
+		c.JSON(http.StatusBadRequest, ResponseError{"valid RTSP URL required"})
+		return
+	}
+	id := Config.addURL(rawURL)
+	muxer, codecs, answer := negotiate(c, id, c.PostForm("sdp64"))
+	if muxer == nil {
+		return
+	}
+	response := Response{Sdp64: answer, Tracks: []string{}}
+	for _, track := range codecTracks(codecs.codecs) {
+		response.Tracks = append(response.Tracks, track.Type)
+	}
+	c.JSON(http.StatusOK, response)
+	go serveViewer(id, codecs, muxer)
+}
+
+func serveViewer(id string, codecs *streamSnapshot, muxer *WebRTCMuxer) {
+	defer muxer.Close()
+	// Subscribe only when ICE and DTLS are ready, so the first IDR is delivered.
+	connectionTimeout := time.NewTimer(30 * time.Second)
+	defer connectionTimeout.Stop()
+	select {
+	case <-muxer.Done():
+		return
+	case <-connectionTimeout.C:
+		log.Printf("stream=%s WebRTC connection timeout", id)
+		return
+	case <-muxer.Ready():
+	}
+	cid, packets := Config.clAd(id, codecs.generation)
+	defer Config.clDe(id, cid)
+	log.Printf("stream=%s viewer=%s connected", id, cid)
+	err := forwardPackets(packets, muxer.Done(), muxer, codecs.codecs, mediaIdleTimeout)
+	if err != nil && !errors.Is(err, io.EOF) {
+		log.Printf("stream=%s viewer=%s ended: %v", id, cid, err)
+	}
 }
 
 func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
-		c.Header("Access-Control-Allow-Credentials", "true")
-		c.Header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization, x-access-token")
-		c.Header("Access-Control-Expose-Headers", "Content-Length, Access-Control-Allow-Origin, Access-Control-Allow-Headers, Cache-Control, Content-Language, Content-Type")
-		c.Header("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT")
-
+		c.Header("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization")
+		c.Header("Access-Control-Allow-Methods", "POST, OPTIONS, GET")
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(http.StatusNoContent)
 			return
 		}
-
 		c.Next()
 	}
-}
-
-type Response struct {
-	Tracks []string `json:"tracks"`
-	Sdp64  string   `json:"sdp64"`
-}
-
-type ResponseError struct {
-	Error string `json:"error"`
-}
-
-func HTTPAPIServerStreamWebRTC2(c *gin.Context) {
-	url := c.PostForm("url")
-	if _, ok := Config.Streams[url]; !ok {
-		Config.Streams[url] = StreamST{
-			URL:      url,
-			OnDemand: true,
-			Cl:       make(map[string]viewer),
-		}
-	}
-
-	Config.RunIFNotRun(url)
-
-	codecs := Config.coGe(url)
-	if codecs == nil {
-		log.Println("Stream Codec Not Found")
-		c.JSON(500, ResponseError{Error: Config.LastError.Error()})
-		return
-	}
-
-	muxerWebRTC := webrtc.NewMuxer(
-		webrtc.Options{
-			ICEServers: Config.GetICEServers(),
-			PortMin:    Config.GetWebRTCPortMin(),
-			PortMax:    Config.GetWebRTCPortMax(),
-		},
-	)
-
-	sdp64 := c.PostForm("sdp64")
-	answer, err := muxerWebRTC.WriteHeader(codecs, sdp64)
-	if err != nil {
-		log.Println("Muxer WriteHeader", err)
-		c.JSON(500, ResponseError{Error: err.Error()})
-		return
-	}
-
-	response := Response{
-		Sdp64: answer,
-	}
-
-	for _, codec := range codecs {
-		if codec.Type() != av.H264 &&
-			codec.Type() != av.PCM_ALAW &&
-			codec.Type() != av.PCM_MULAW &&
-			codec.Type() != av.OPUS {
-			log.Println("Codec Not Supported WebRTC ignore this track", codec.Type())
-			continue
-		}
-		if codec.Type().IsVideo() {
-			response.Tracks = append(response.Tracks, "video")
-		} else {
-			response.Tracks = append(response.Tracks, "audio")
-		}
-	}
-
-	c.JSON(200, response)
-
-	AudioOnly := len(codecs) == 1 && codecs[0].Type().IsAudio()
-
-	go func() {
-		cid, ch := Config.clAd(url)
-		defer Config.clDe(url, cid)
-		defer muxerWebRTC.Close()
-		var videoStart bool
-		noVideo := time.NewTimer(10 * time.Second)
-		for {
-			select {
-			case <-noVideo.C:
-				log.Println("noVideo")
-				return
-			case pck := <-ch:
-				if pck.IsKeyFrame || AudioOnly {
-					noVideo.Reset(10 * time.Second)
-					videoStart = true
-				}
-				if !videoStart && !AudioOnly {
-					continue
-				}
-				err = muxerWebRTC.WritePacket(pck)
-				if err != nil {
-					log.Println("WritePacket", err)
-					return
-				}
-			}
-		}
-	}()
 }

@@ -1,0 +1,20 @@
+services:
+  rtsp-to-webrtc:
+    build: .
+    image: rtsp-to-webrtc:local
+    restart: unless-stopped
+    # WebRTC advertises the host's LAN address and uses its UDP ports directly.
+    network_mode: host
+    volumes:
+      - ./config.local.json:/app/config.json:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8083/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

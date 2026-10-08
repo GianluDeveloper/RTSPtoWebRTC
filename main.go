@@ -8,6 +8,7 @@ import (
 )
 
 func main() {
+	Config = loadConfig()
 	go serveHTTP()
 	go serveStreams()
 	sigs := make(chan os.Signal, 1)

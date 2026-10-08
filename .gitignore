@@ -2,3 +2,6 @@
 .idea/
 
 bin/
+
+# Local camera credentials are mounted at runtime only.
+config.local.json
